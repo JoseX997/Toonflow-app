@@ -1,0 +1,17 @@
+{
+  "baseUrl": "http://localhost:10588",
+  "projectName": "我拿三十年寿命换了个“升级咯”",
+  "scriptIndex": 0,
+  "autoStart": false,
+  "autoApprove": true,
+  "autoApproveUnscored": true,
+  "startPrompt": "从导演规划开始，严格按 Toonflow 自身的制作流程推进；每个需要用户确认的节点完成后等待审批。",
+  "quietPeriodMs": 4000,
+  "pollIntervalMs": 5000,
+  "generationTimeoutMs": 1800000,
+  "turnTimeoutMs": 1800000,
+  "concurrentCount": 5,
+  "maxRepairRounds": 2,
+  "think": false,
+  "thinkLevel": 0
+}
