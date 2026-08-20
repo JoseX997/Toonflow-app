@@ -8,6 +8,7 @@
   "autoApprove": true,
   "stateFile": "user/tools/controller-state.json",
   "autoAdvanceEpisodes": true,
+  "requireSevereIssueResolution": true,
   "generateFinalVideoPrompts": true,
   "finalPromptTimeoutMs": 1800000,
   "finalPromptPollIntervalMs": 5000,

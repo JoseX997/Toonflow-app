@@ -25,6 +25,7 @@ const DEFAULTS = {
   backendStartupTimeoutMs: 30 * 1000,
   stateFile: "user/tools/controller-state.json",
   autoAdvanceEpisodes: true,
+  requireSevereIssueResolution: true,
   generateFinalVideoPrompts: false,
   finalPromptTimeoutMs: 30 * 60 * 1000,
   finalPromptPollIntervalMs: 5000,
@@ -35,6 +36,8 @@ const DEFAULTS = {
   confirmPrompt: "确认。若当前节点要求选择生成范围，选择 Toonflow 当前清单中的全部项目；其余情况按 Toonflow 当前默认路线继续下一阶段。",
   repairPrompt:
     "确认修复。严格采用刚才 Toonflow 审核报告的问题清单与建议方案；单一方案按原建议执行，多选方案采用每项列出的第一个方案。不要增加新的问题或方案；完成后按 Toonflow 原规则重新审核。",
+  severeRepairPrompt:
+    "确认继续修复。问题清单中仍有“严重程度：严重”的审核项；请逐项严格采用各严重项后面对应的 Toonflow 原生建议方案完成修复。不要自行增加问题、标准或方案；完成后按 Toonflow 原规则重新审核，并输出新的问题清单、严重程度和建议方案。",
   quietPeriodMs: 4000,
   pollIntervalMs: 5000,
   generationTimeoutMs: 30 * 60 * 1000,
@@ -460,6 +463,31 @@ function hasActionableRepairAdvice(text) {
   return /问题清单|建议方案|建议修复|修复方案|方案\s*[A-C]|按.{0,20}修复/.test(String(text ?? ""));
 }
 
+function problemListSection(text) {
+  const source = String(text ?? "");
+  const heading = /问题清单\s*[:：]?/i.exec(source);
+  if (!heading) return "";
+  const section = source.slice(heading.index + heading[0].length);
+  const endHeading = /(?:^|\n)\s*(?:#{1,6}\s*)?(?:审核结论|最终结论|总体评价|综合评价|评分|评级|等级)\s*[:：]/im.exec(section);
+  return endHeading ? section.slice(0, endHeading.index) : section;
+}
+
+function analyzeSevereIssues(text) {
+  const section = problemListSection(text);
+  const severityPattern = /(?:\*{0,2})严重程度(?:\*{0,2})\s*[:：]\s*(?:\*{0,2})严重(?:\*{0,2})(?=$|[\s，,；;。])/g;
+  const matches = [...section.matchAll(severityPattern)];
+  const issues = matches.map((match, index) => {
+    const following = section.slice(match.index + match[0].length, matches[index + 1]?.index ?? section.length);
+    const advice = /(?:\*{0,2})建议方案(?:\*{0,2})\s*[:：]\s*(?!无(?:\s|$)|未提供|缺失)(\S[\s\S]*)/i.exec(following);
+    return { hasAdvice: Boolean(advice), adviceCharacters: advice ? advice[1].trim().length : 0 };
+  });
+  return {
+    count: issues.length,
+    missingAdvice: issues.filter((issue) => !issue.hasAdvice).length,
+    issues,
+  };
+}
+
 function executionRetryPrompt(phase, rejections = []) {
   if (rejections.length) {
     const tags = [...new Set(rejections.map((item) => item.tag))].join("、");
@@ -544,6 +572,26 @@ function detectWorkflowEvidence(turn, beforeSnapshot, afterSnapshot, state) {
 }
 
 function gradeDecision(grade, config, repairRounds, text) {
+  const severe = config.requireSevereIssueResolution === false ? { count: 0, missingAdvice: 0 } : analyzeSevereIssues(text);
+  if (grade && "AB".includes(grade) && severe.count > 0) {
+    if (severe.missingAdvice > 0) {
+      return {
+        action: "pause",
+        grade,
+        severeIssues: severe.count,
+        reason: `问题清单仍有 ${severe.count} 个严重项，其中 ${severe.missingAdvice} 个缺少可关联的 Toonflow 原生建议方案`,
+      };
+    }
+    const cycleSize = Math.max(1, Number(config.maxRepairRounds) || 1);
+    return {
+      action: "repair",
+      grade,
+      severeIssues: severe.count,
+      prompt: config.severeRepairPrompt || DEFAULTS.severeRepairPrompt,
+      resetRepairCycle: repairRounds >= cycleSize,
+      reason: `评分为 ${grade}，但问题清单仍有 ${severe.count} 个“严重程度：严重”的审核项，必须按对应建议方案继续修复`,
+    };
+  }
   if (grade === "A") return { action: "approve", grade, prompt: config.approvalPrompt };
   if (grade === "B" && repairRounds > 0) {
     return {
@@ -1614,6 +1662,40 @@ function runSelfTests() {
       false,
     ) === "user/tools/controller-state.5.8.json",
   );
+
+  const severeReport = "评分：A\n问题清单：\n1. 因果链缺失\n严重程度：严重\n建议方案：补齐证据来源。\n审核结论：暂不通过";
+  const severeA = gradeDecision("A", DEFAULTS, 0, severeReport);
+  check("A 级仍有严重项时继续修复", severeA?.action === "repair" && severeA.severeIssues === 1);
+
+  const severeRepairedB = gradeDecision("B", DEFAULTS, 1, severeReport.replace("评分：A", "评分：B"));
+  check("修复后 B 级仍有严重项时继续修复", severeRepairedB?.action === "repair");
+
+  const cleanRepairedB = gradeDecision(
+    "B",
+    DEFAULTS,
+    1,
+    "评分：B\n问题清单：\n1. 表述略长\n严重程度：一般\n建议方案：精简台词。",
+  );
+  check("修复后 B 级无严重项时通过", cleanRepairedB?.action === "approve");
+
+  const cleanA = gradeDecision("A", DEFAULTS, 0, "评分：A\n问题清单：无");
+  check("A 级无严重项时通过", cleanA?.action === "approve");
+
+  const descriptiveSevere = gradeDecision(
+    "A",
+    DEFAULTS,
+    0,
+    "评分：A\n问题清单：\n1. 若不处理可能造成严重影响\n严重程度：一般\n建议方案：调整措辞。",
+  );
+  check("普通正文出现严重二字不误判", descriptiveSevere?.action === "approve");
+
+  const missingSevereAdvice = gradeDecision(
+    "A",
+    DEFAULTS,
+    0,
+    "评分：A\n问题清单：\n1. 因果断裂\n严重程度：严重\n审核结论：暂不通过",
+  );
+  check("严重项缺少对应建议方案时暂停", missingSevereAdvice?.action === "pause");
 
   emit("self_test.complete", { passed: checks.length, checks });
 }
