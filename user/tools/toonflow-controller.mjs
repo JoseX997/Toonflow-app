@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { createHash } from "node:crypto";
+import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import { createRequire } from "node:module";
 import path from "node:path";
@@ -19,8 +20,13 @@ const TERMINAL_STATUSES = new Set(["complete", "error", "stop"]);
 const DEFAULTS = {
   baseUrl: "http://localhost:10588",
   autoApprove: true,
-  autoApproveUnscored: true,
   autoStart: false,
+  ensureBackend: true,
+  backendStartupTimeoutMs: 30 * 1000,
+  stateFile: "user/tools/controller-state.json",
+  generateFinalVideoPrompts: false,
+  finalPromptTimeoutMs: 30 * 60 * 1000,
+  finalPromptPollIntervalMs: 5000,
   startPrompt: "从导演规划开始，严格按 Toonflow 自身的制作流程推进；每个需要用户确认的节点完成后等待审批。",
   approvalPrompt: "审核通过，继续 Toonflow 原生流程的下一阶段。",
   confirmPrompt: "确认。若当前节点要求选择生成范围，选择 Toonflow 当前清单中的全部项目；其余情况按 Toonflow 当前默认路线继续下一阶段。",
@@ -32,6 +38,7 @@ const DEFAULTS = {
   turnTimeoutMs: 30 * 60 * 1000,
   concurrentCount: 5,
   maxRepairRounds: 2,
+  maxNoEvidenceRetries: 1,
   initialRepairRounds: 0,
   think: false,
   thinkLevel: 0,
@@ -53,8 +60,11 @@ function parseArgs(argv) {
     configExplicit: false,
     autoStart: undefined,
     autoApprove: undefined,
+    ensureBackend: undefined,
     list: false,
     probe: false,
+    finalPrompts: false,
+    selfTest: false,
     help: false,
   };
   for (let index = 0; index < argv.length; index += 1) {
@@ -68,10 +78,18 @@ function parseArgs(argv) {
       args.autoApprove = true;
     } else if (arg === "--no-auto") {
       args.autoApprove = false;
+    } else if (arg === "--ensure-backend") {
+      args.ensureBackend = true;
+    } else if (arg === "--no-ensure-backend") {
+      args.ensureBackend = false;
     } else if (arg === "--list") {
       args.list = true;
     } else if (arg === "--probe") {
       args.probe = true;
+    } else if (arg === "--final-prompts") {
+      args.finalPrompts = true;
+    } else if (arg === "--self-test") {
+      args.selfTest = true;
     } else if (arg === "--help" || arg === "-h") {
       args.help = true;
     } else {
@@ -84,9 +102,13 @@ function parseArgs(argv) {
 function printHelp() {
   process.stdout.write(`Toonflow 用户侧控制器\n\n`);
   process.stdout.write(`用法:\n`);
-  process.stdout.write(`  node user/tools/toonflow-controller.mjs --config <配置文件> [--start] [--auto|--no-auto]\n`);
+  process.stdout.write(
+    `  node user/tools/toonflow-controller.mjs --config <配置文件> [--start] [--auto|--no-auto] [--ensure-backend|--no-ensure-backend]\n`,
+  );
   process.stdout.write(`  node user/tools/toonflow-controller.mjs --config <配置文件> --list\n`);
   process.stdout.write(`  node user/tools/toonflow-controller.mjs --config <配置文件> --probe\n\n`);
+  process.stdout.write(`  node user/tools/toonflow-controller.mjs --config <配置文件> --final-prompts\n\n`);
+  process.stdout.write(`  node user/tools/toonflow-controller.mjs --self-test\n\n`);
   process.stdout.write(`凭据只从 TOONFLOW_TOKEN，或 TOONFLOW_USERNAME + TOONFLOW_PASSWORD 环境变量读取。\n`);
 }
 
@@ -105,6 +127,7 @@ async function loadConfig(args) {
     ...config,
     autoStart: args.autoStart ?? config.autoStart ?? DEFAULTS.autoStart,
     autoApprove: args.autoApprove ?? config.autoApprove ?? DEFAULTS.autoApprove,
+    ensureBackend: args.ensureBackend ?? config.ensureBackend ?? DEFAULTS.ensureBackend,
   };
 }
 
@@ -112,6 +135,75 @@ function normalizeBaseUrl(value) {
   return String(value || DEFAULTS.baseUrl)
     .replace(/\/+$/, "")
     .replace(/\/api$/i, "");
+}
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function backendIsReady(baseUrl, timeoutMs = 1500) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(`${normalizeBaseUrl(baseUrl)}/`, {
+      method: "GET",
+      signal: controller.signal,
+    });
+    await response.body?.cancel();
+    return true;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function isLocalBackendUrl(baseUrl) {
+  const url = new URL(normalizeBaseUrl(baseUrl));
+  const localHosts = new Set(["localhost", "127.0.0.1", "[::1]", "::1"]);
+  const port = url.port || (url.protocol === "https:" ? "443" : "80");
+  return localHosts.has(url.hostname) && port === "10588";
+}
+
+async function ensureBackend(config) {
+  if (await backendIsReady(config.baseUrl)) {
+    emit("backend.ready", { source: "existing", baseUrl: normalizeBaseUrl(config.baseUrl) });
+    return;
+  }
+  if (!config.ensureBackend) {
+    throw fail(`Toonflow 后端未运行: ${normalizeBaseUrl(config.baseUrl)}`);
+  }
+  if (!isLocalBackendUrl(config.baseUrl)) {
+    throw fail("自动启动仅支持本机 http://localhost:10588；远程地址必须由用户自行启动");
+  }
+
+  const entryPath = path.join(repoRoot, "data", "serve", "app.js");
+  await fs.access(entryPath);
+  const child = spawn(process.execPath, [entryPath], {
+    cwd: repoRoot,
+    detached: true,
+    env: { ...process.env, NODE_ENV: "prod" },
+    stdio: "ignore",
+    windowsHide: true,
+  });
+  let spawnError = null;
+  child.once("error", (error) => {
+    spawnError = error;
+  });
+  child.unref();
+  emit("backend.started", { pid: child.pid, entry: "data/serve/app.js" });
+
+  const deadline = Date.now() + Number(config.backendStartupTimeoutMs || DEFAULTS.backendStartupTimeoutMs);
+  while (Date.now() < deadline) {
+    if (spawnError) throw fail("Toonflow 后端启动失败", spawnError);
+    if (child.exitCode !== null) throw fail(`Toonflow 后端启动后退出，退出码 ${child.exitCode}`);
+    if (await backendIsReady(config.baseUrl)) {
+      emit("backend.ready", { source: "started", baseUrl: normalizeBaseUrl(config.baseUrl), pid: child.pid });
+      return;
+    }
+    await wait(500);
+  }
+  throw fail(`等待 Toonflow 后端启动超时: ${normalizeBaseUrl(config.baseUrl)}`);
 }
 
 class ToonflowApi {
@@ -227,6 +319,8 @@ async function resolveContext(api, config) {
     projectName: itemName(project),
     scriptId: Number(script.id),
     scriptName: itemName(script),
+    videoModel: project.videoModel,
+    videoMode: project.mode,
   };
   emit("context.ready", context);
   return context;
@@ -291,18 +385,125 @@ function gradeFromText(text) {
   return null;
 }
 
-function classifyTurn(turn, config, repairRounds) {
-  const text = turn.text;
-  if (turn.statuses.some((status) => status === "error" || status === "stop")) {
-    return { action: "pause", reason: `消息终态为 ${turn.statuses.join(",")}` };
+function hashValue(value) {
+  return createHash("sha256").update(String(value ?? "")).digest("hex");
+}
+
+const WORKSPACE_MIN_CHARACTERS = { scriptPlan: 200, storyboardTable: 200 };
+const WORKSPACE_PLACEHOLDER_PATTERN = /^(?:\.{3,}|…+|\{\s*\}|\[\s*\]|null|undefined|待补充|省略)$/i;
+const EXECUTION_PROMISE_PATTERN = /(?:将|现在|立即|接下来).{0,24}(?:派发|开始|进入|执行)|让我.{0,24}(?:派发|执行)|请前往.{0,16}工作台/;
+
+function workspaceValueIssue(tag, incoming, current = "") {
+  const value = String(incoming ?? "").trim();
+  const previous = String(current ?? "").trim();
+  const minimum = Number(WORKSPACE_MIN_CHARACTERS[tag]) || 100;
+  if (!value) return `${tag} 为空`;
+  if (WORKSPACE_PLACEHOLDER_PATTERN.test(value)) return `${tag} 是占位内容`;
+  if (previous.length >= minimum * 5 && value.length < minimum && value.length < previous.length * 0.1) {
+    return `${tag} 从 ${previous.length} 字异常缩短为 ${value.length} 字`;
   }
-  if (turn.generationFailures.length) {
-    return { action: "pause", reason: "后台生成存在失败项", failures: turn.generationFailures };
+  return null;
+}
+
+function phaseKey(phase) {
+  return String(phase || "unassigned");
+}
+
+function phaseCounter(state, mapName, phase, legacyName) {
+  const stored = state?.[mapName]?.[phaseKey(phase)];
+  if (Number.isFinite(Number(stored))) return Math.max(0, Number(stored));
+  if (phase === state?.currentPhase && Number.isFinite(Number(state?.[legacyName]))) return Math.max(0, Number(state[legacyName]));
+  return 0;
+}
+
+function hasActionableRepairAdvice(text) {
+  return /问题清单|建议方案|建议修复|修复方案|方案\s*[A-C]|按.{0,20}修复/.test(String(text ?? ""));
+}
+
+function executionRetryPrompt(phase, rejections = []) {
+  if (rejections.length) {
+    const tags = [...new Set(rejections.map((item) => item.tag))].join("、");
+    return `检测到 ${tags} 的写入内容是占位符或异常短文本，已拒绝覆盖原有效数据。请仅恢复当前节点：实际调用执行层重新输出完整的 ${tags} 标签内容并写回工作区；不要只回复将要执行，不要重跑或修改已经验收的其他阶段。`;
   }
-  if (/流程(?:已经|已)?(?:全部)?完成|制作完成|结束流程|任务已启动并结束流程/.test(text)) {
-    return { action: "finish", reason: "Toonflow 已声明流程结束" };
+  return `当前${phase ? ` ${phase} ` : ""}节点只收到承诺性回复，但没有观察到工具事件、工作区变化或后台任务。请现在实际调用执行层和该节点既定工具完成当前节点；不要只说明“将派发”或让用户前往其他页面，也不要重跑已经验收的阶段。`;
+}
+
+function buildFlowSnapshot(flowData) {
+  const flow = flowData ?? {};
+  const derives = (flow.assets ?? [])
+    .flatMap((asset) => (asset.derive ?? []).map((derive) => ({ id: Number(derive.id), state: String(derive.state ?? "") })))
+    .filter((item) => Number.isFinite(item.id))
+    .sort((a, b) => a.id - b.id);
+  const storyboard = (flow.storyboard ?? [])
+    .map((item) => ({
+      id: Number(item.id),
+      promptHash: hashValue(item.prompt),
+      promptCharacters: String(item.prompt ?? "").trim().length,
+      videoDescHash: hashValue(item.videoDesc),
+      videoDescCharacters: String(item.videoDesc ?? "").trim().length,
+      shouldGenerateImage: Number(item.shouldGenerateImage) === 1 ? 1 : 0,
+      state: String(item.state ?? ""),
+    }))
+    .filter((item) => Number.isFinite(item.id))
+    .sort((a, b) => a.id - b.id);
+  const snapshot = {
+    scriptPlanHash: hashValue(flow.scriptPlan),
+    scriptPlanCharacters: String(flow.scriptPlan ?? "").length,
+    storyboardTableHash: hashValue(flow.storyboardTable),
+    storyboardTableCharacters: String(flow.storyboardTable ?? "").length,
+    derives,
+    storyboard,
+  };
+  return { ...snapshot, digest: hashValue(JSON.stringify(snapshot)) };
+}
+
+function diffFlowSnapshots(before, after) {
+  const beforeDerives = new Map((before?.derives ?? []).map((item) => [item.id, item]));
+  const afterDerives = new Map((after?.derives ?? []).map((item) => [item.id, item]));
+  const beforeStoryboard = new Map((before?.storyboard ?? []).map((item) => [item.id, item]));
+  const afterStoryboard = new Map((after?.storyboard ?? []).map((item) => [item.id, item]));
+  return {
+    scriptPlanChanged: before?.scriptPlanHash !== after?.scriptPlanHash,
+    storyboardTableChanged: before?.storyboardTableHash !== after?.storyboardTableHash,
+    deriveAdded: [...afterDerives.keys()].filter((id) => !beforeDerives.has(id)),
+    deriveRemoved: [...beforeDerives.keys()].filter((id) => !afterDerives.has(id)),
+    deriveStateChanged: [...afterDerives.values()].filter((item) => beforeDerives.has(item.id) && beforeDerives.get(item.id).state !== item.state),
+    storyboardAdded: [...afterStoryboard.values()].filter((item) => !beforeStoryboard.has(item.id)),
+    storyboardRemoved: [...beforeStoryboard.keys()].filter((id) => !afterStoryboard.has(id)),
+    storyboardChanged: [...afterStoryboard.values()].filter((item) => {
+      const previous = beforeStoryboard.get(item.id);
+      return previous && JSON.stringify(previous) !== JSON.stringify(item);
+    }),
+  };
+}
+
+function detectWorkflowEvidence(turn, beforeSnapshot, afterSnapshot, state) {
+  const diff = diffFlowSnapshots(beforeSnapshot, afterSnapshot);
+  const events = turn.toolEvents ?? [];
+  const hasTool = (tool) => events.some((event) => event.tool === tool);
+  const hasGeneration = (kind) => events.some((event) => event.tool === "generation.complete" && event.kind === kind);
+
+  if (hasGeneration("storyboard")) return { phase: "stage6", kind: "generation", diff };
+  if (diff.storyboardAdded.length || hasTool("addStoryboard")) {
+    const added = diff.storyboardAdded.length
+      ? diff.storyboardAdded
+      : events.filter((event) => event.tool === "addStoryboard");
+    const noImages = added.length > 0 && added.every((item) => Number(item.shouldGenerateImage) === 0);
+    return { phase: "stage5", kind: "workspace", terminalNoImages: noImages, diff };
   }
-  const grade = gradeFromText(text);
+  if (diff.storyboardTableChanged || hasTool("storyboardTable")) return { phase: "stage4", kind: "workspace", diff };
+  if (diff.deriveStateChanged.length || hasGeneration("assets")) return { phase: "stage3", kind: "generation", diff };
+  if (diff.deriveAdded.length || diff.deriveRemoved.length || hasTool("addDeriveAsset") || hasTool("delDeriveAsset")) {
+    return { phase: "stage2", kind: "workspace", diff };
+  }
+  if (diff.scriptPlanChanged || hasTool("scriptPlan")) return { phase: "stage1", kind: "workspace", diff };
+
+  const grade = gradeFromText(turn.text);
+  if (grade && state?.currentPhase) return { phase: state.currentPhase, kind: "review", diff };
+  return null;
+}
+
+function gradeDecision(grade, config, repairRounds, text) {
   if (grade === "A") return { action: "approve", grade, prompt: config.approvalPrompt };
   if (grade === "B" && repairRounds > 0) {
     return {
@@ -313,20 +514,98 @@ function classifyTurn(turn, config, repairRounds) {
     };
   }
   if (grade && "BCD".includes(grade)) {
-    if (repairRounds >= config.maxRepairRounds) {
-      return { action: "pause", grade, reason: `已达到最大原生修复轮数 ${config.maxRepairRounds}` };
+    if (!hasActionableRepairAdvice(text)) {
+      return { action: "pause", grade, reason: `${grade} 级审核缺少明确问题清单或原生修复建议` };
     }
-    return { action: "repair", grade, prompt: config.repairPrompt };
+    const cycleSize = Math.max(1, Number(config.maxRepairRounds) || 1);
+    return {
+      action: "repair",
+      grade,
+      prompt: config.repairPrompt,
+      resetRepairCycle: repairRounds >= cycleSize,
+      reason: repairRounds >= cycleSize ? `已完成 ${cycleSize} 轮本地修复计数；原生建议仍明确，重置当前节点计数并继续修复` : undefined,
+    };
   }
-  if (/无法识别|不存在|参数错误|执行失败|审核失败|生成失败|发生错误|请检查/.test(text)) {
-    return { action: "pause", reason: "Toonflow 返回错误或无法识别状态" };
+  return null;
+}
+
+function classifyTurn(turn, config, state, beforeSnapshot, afterSnapshot) {
+  const text = turn.text;
+  if (turn.statuses.some((status) => status === "error" || status === "stop")) {
+    return { action: "pause", reason: `消息终态为 ${turn.statuses.join(",")}` };
   }
-  const asksForDecision = /需要您决定|等待(?:用户|您的)?(?:确认|审批|决定)|请(?:您)?确认|是否(?:继续|进入|生成|修复)|下一步(?:是否|计划)|回复[“\"]?(?:继续|确认)/.test(text);
-  const reportsCompletion = /已完成|完成确认|写入完成|开始生成|清单|审核报告|下一阶段/.test(text);
-  if (config.autoApproveUnscored && asksForDecision && reportsCompletion) {
-    return { action: "confirm", prompt: config.confirmPrompt };
+  if (turn.generationFailures.length) {
+    return { action: "pause", reason: "后台生成存在失败项", failures: turn.generationFailures };
   }
-  return { action: "pause", reason: grade ? `未配置评分 ${grade} 的处理规则` : "没有识别到 Toonflow 原生评分或明确审批请求" };
+  const evidence = detectWorkflowEvidence(turn, beforeSnapshot, afterSnapshot, state);
+  if (!evidence) {
+    const retries = phaseCounter(state, "continuationRetriesByPhase", state?.currentPhase, "continuationRetries");
+    const maxRetries = Math.max(0, Number(config.maxNoEvidenceRetries) || 0);
+    const rejections = turn.workspaceRejections ?? [];
+    if ((rejections.length || EXECUTION_PROMISE_PATTERN.test(text)) && retries < maxRetries) {
+      return {
+        action: "retry",
+        phase: state?.currentPhase ?? null,
+        prompt: executionRetryPrompt(state?.currentPhase, rejections),
+        reason: rejections.length ? "关键工作区字段写入被完整性保护拒绝，自动要求执行层恢复" : "仅收到执行承诺但没有完成证据，自动续催当前节点",
+      };
+    }
+    return {
+      action: "pause",
+      reason: rejections.length
+        ? "关键工作区字段连续返回无效内容，已达到自动恢复次数"
+        : "未观察到工具事件或工作区数据变化；保持静默，不自动审批",
+    };
+  }
+
+  const recoveryTags = Array.isArray(state?.workspaceRecoveryTags) ? state.workspaceRecoveryTags : [];
+  const recoveredTools = new Set((turn.toolEvents ?? []).map((event) => event.tool));
+  if (
+    state?.workspaceRecoveryPhase &&
+    recoveryTags.length &&
+    recoveryTags.every((tag) => recoveredTools.has(tag)) &&
+    evidence.phase !== state.workspaceRecoveryPhase
+  ) {
+    return {
+      action: "retry",
+      phase: state.workspaceRecoveryPhase,
+      prompt: executionRetryPrompt(state.workspaceRecoveryPhase),
+      reason: "关键字段已恢复，返回异常发生前的节点继续执行",
+      workspaceRecoveryCompleted: true,
+    };
+  }
+
+  const grade = gradeFromText(text);
+
+  if (evidence.phase === "stage6") return { action: "finish", phase: evidence.phase, reason: "阶段6后台生成已完成" };
+  if (evidence.phase === "stage5" && evidence.terminalNoImages) {
+    return config.generateFinalVideoPrompts
+      ? { action: "generate_prompts", phase: evidence.phase, reason: "阶段5已写入且全部不出图，进入最终视频提示词生成" }
+      : { action: "finish", phase: evidence.phase, reason: "阶段5已写入且全部不出图，流程到达终点" };
+  }
+
+  const repairRounds = phaseCounter(state, "repairRoundsByPhase", evidence.phase, "repairRounds");
+  const scored = gradeDecision(grade, config, repairRounds, text);
+  if (scored) return { ...scored, phase: evidence.phase };
+  if (evidence.phase === "stage4") {
+    return { action: "pause", phase: evidence.phase, reason: "阶段4数据已变化，但尚未收到 Toonflow 原生评分" };
+  }
+  return {
+    action: "confirm",
+    phase: evidence.phase,
+    reason: `${evidence.phase} 已由工具事件和工作区数据变化确认完成`,
+    prompt: config.confirmPrompt,
+  };
+}
+
+function processIsRunning(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 class ToonflowController {
@@ -344,14 +623,38 @@ class ToonflowController {
     this.turnTimer = null;
     this.persistQueue = Promise.resolve();
     this.persistedTags = new Set();
+    this.rejectedTags = new Set();
     this.generations = new Map();
-    this.repairRounds = Math.max(0, Number(config.initialRepairRounds) || 0);
+    this.statePath = this.resolveStatePath();
+    this.state = {
+      version: 2,
+      projectId: context.projectId,
+      scriptId: context.scriptId,
+      currentPhase: null,
+      repairRounds: Math.max(0, Number(config.initialRepairRounds) || 0),
+      repairRoundsByPhase: {},
+      continuationRetries: 0,
+      continuationRetriesByPhase: {},
+      workspaceRecoveryPhase: null,
+      workspaceRecoveryTags: [],
+      approvedDecisionKeys: [],
+      lastSnapshot: null,
+      pid: null,
+      updatedAt: null,
+    };
     this.closed = false;
     this.rl = null;
   }
 
   async initialize() {
     this.flowData = await this.fetchFlowData();
+    await this.loadState();
+    if (this.state.pid && this.state.pid !== process.pid && processIsRunning(Number(this.state.pid))) {
+      throw fail(`该项目已有控制器实例在运行，PID ${this.state.pid}`);
+    }
+    this.state.pid = process.pid;
+    this.state.lastSnapshot = buildFlowSnapshot(this.flowData);
+    await this.saveState();
     this.socket = io(`${this.api.baseUrl}/api/socket/productionAgent`, {
       auth: {
         token: this.api.token,
@@ -392,7 +695,92 @@ class ToonflowController {
       projectId: this.context.projectId,
       scriptId: this.context.scriptId,
       autoApprove: Boolean(this.config.autoApprove),
+      stateFile: this.statePath,
     });
+    emit("workflow.progress", { phase: this.state.currentPhase, status: "monitoring", message: "Codex 监控轨已连接" });
+  }
+
+  resolveStatePath() {
+    const configured = String(this.config.stateFile || DEFAULTS.stateFile);
+    const resolved = path.isAbsolute(configured) ? path.resolve(configured) : path.resolve(repoRoot, configured);
+    const userRoot = path.resolve(repoRoot, "user");
+    if (resolved !== userRoot && !resolved.startsWith(`${userRoot}${path.sep}`)) {
+      throw fail(`stateFile 必须位于用户定义层 user/ 内: ${resolved}`);
+    }
+    return resolved;
+  }
+
+  async loadState() {
+    let saved;
+    try {
+      saved = JSON.parse(await fs.readFile(this.statePath, "utf8"));
+    } catch (error) {
+      if (error?.code !== "ENOENT") emit("state.warning", { message: `状态文件读取失败，将使用新状态: ${error.message}` });
+      return;
+    }
+    if (Number(saved.projectId) !== this.context.projectId || Number(saved.scriptId) !== this.context.scriptId) {
+      emit("state.warning", { message: "状态文件属于其他项目或分集，已忽略" });
+      return;
+    }
+    this.state = {
+      ...this.state,
+      ...saved,
+      version: 2,
+      repairRounds: Math.max(0, Number(saved.repairRounds) || 0),
+      repairRoundsByPhase: saved.repairRoundsByPhase && typeof saved.repairRoundsByPhase === "object" ? saved.repairRoundsByPhase : {},
+      continuationRetries: Math.max(0, Number(saved.continuationRetries) || 0),
+      continuationRetriesByPhase:
+        saved.continuationRetriesByPhase && typeof saved.continuationRetriesByPhase === "object"
+          ? saved.continuationRetriesByPhase
+          : {},
+      workspaceRecoveryPhase: saved.workspaceRecoveryPhase || null,
+      workspaceRecoveryTags: Array.isArray(saved.workspaceRecoveryTags) ? saved.workspaceRecoveryTags : [],
+      approvedDecisionKeys: Array.isArray(saved.approvedDecisionKeys) ? saved.approvedDecisionKeys.slice(-100) : [],
+    };
+    const currentKey = phaseKey(this.state.currentPhase);
+    if (!Number.isFinite(Number(this.state.repairRoundsByPhase[currentKey]))) {
+      this.state.repairRoundsByPhase[currentKey] = this.state.repairRounds;
+    }
+    if (!Number.isFinite(Number(this.state.continuationRetriesByPhase[currentKey]))) {
+      this.state.continuationRetriesByPhase[currentKey] = this.state.continuationRetries;
+    }
+    emit("state.loaded", {
+      phase: this.state.currentPhase,
+      repairRounds: this.state.repairRounds,
+      continuationRetries: this.state.continuationRetries,
+      approvedDecisions: this.state.approvedDecisionKeys.length,
+    });
+  }
+
+  async saveState() {
+    this.state.updatedAt = new Date().toISOString();
+    await fs.mkdir(path.dirname(this.statePath), { recursive: true });
+    const temporary = `${this.statePath}.${process.pid}.tmp`;
+    await fs.writeFile(temporary, `${JSON.stringify(this.state, null, 2)}\n`, "utf8");
+    await fs.rename(temporary, this.statePath);
+  }
+
+  setRepairRounds(phase, value) {
+    const normalized = Math.max(0, Number(value) || 0);
+    this.state.repairRoundsByPhase ??= {};
+    this.state.repairRoundsByPhase[phaseKey(phase)] = normalized;
+    if (phase === this.state.currentPhase) this.state.repairRounds = normalized;
+  }
+
+  setContinuationRetries(phase, value) {
+    const normalized = Math.max(0, Number(value) || 0);
+    this.state.continuationRetriesByPhase ??= {};
+    this.state.continuationRetriesByPhase[phaseKey(phase)] = normalized;
+    if (phase === this.state.currentPhase) this.state.continuationRetries = normalized;
+  }
+
+  enterPhase(phase) {
+    if (!phase || phase === this.state.currentPhase) return;
+    const nextRepairRounds = Math.max(0, Number(this.state.repairRoundsByPhase?.[phaseKey(phase)]) || 0);
+    const nextContinuationRetries = Math.max(0, Number(this.state.continuationRetriesByPhase?.[phaseKey(phase)]) || 0);
+    this.state.currentPhase = phase;
+    this.setRepairRounds(phase, nextRepairRounds);
+    this.setContinuationRetries(phase, nextContinuationRetries);
   }
 
   installSocketHandlers() {
@@ -414,6 +802,7 @@ class ToonflowController {
       try {
         this.flowData = await this.fetchFlowData();
         callback?.({ success: true, message: "衍生资产已同步" });
+        this.recordToolEvent({ tool: "addDeriveAsset", id: data?.id, assetsId: data?.assetsId });
         emit("tool.complete", { tool: "addDeriveAsset", id: data?.id, assetsId: data?.assetsId });
       } catch (error) {
         callback?.({ error: error.message });
@@ -423,6 +812,7 @@ class ToonflowController {
       try {
         this.flowData = await this.fetchFlowData();
         callback?.({ success: true, message: "衍生资产已删除" });
+        this.recordToolEvent({ tool: "delDeriveAsset", id: data?.id, assetsId: data?.assetsId });
         emit("tool.complete", { tool: "delDeriveAsset", id: data?.id, assetsId: data?.assetsId });
       } catch (error) {
         callback?.({ error: error.message });
@@ -446,7 +836,13 @@ class ToonflowController {
     });
     this.socket.on("generateStoryboard", async (data, callback) => {
       try {
-        const ids = this.normalizeIds(data?.ids);
+        const ids = this.normalizeIds(data?.ids, { allowEmpty: true });
+        if (!ids.length) {
+          const message = "未提供分镜 ID；当前调用已跳过，未启动分镜图生成";
+          callback?.({ success: true, skipped: true, message });
+          emit("generation.skipped", { kind: "storyboard", ids, reason: "empty_ids" });
+          return;
+        }
         const result = await this.api.post("/production/storyboard/batchGenerateImage", {
           storyboardIds: ids,
           projectId: this.context.projectId,
@@ -486,7 +882,15 @@ class ToonflowController {
         this.flowData = await this.fetchFlowData();
         await this.saveFlowData(this.flowData);
         callback?.({ success: true, message: "分镜面板已写入" });
-        emit("tool.complete", { tool: "addStoryboard", track: item.track, duration: item.duration });
+        const event = {
+          tool: "addStoryboard",
+          track: item.track,
+          duration: item.duration,
+          shouldGenerateImage: item.shouldGenerateImage,
+          promptCharacters: item.prompt.trim().length,
+        };
+        this.recordToolEvent(event);
+        emit("tool.complete", event);
       } catch (error) {
         callback?.({ error: error.message });
       }
@@ -498,11 +902,21 @@ class ToonflowController {
     this.socket.on("connect_error", (error) => emit("socket.error", { message: error?.message ?? String(error) }));
   }
 
-  normalizeIds(ids) {
+  normalizeIds(ids, { allowEmpty = false } = {}) {
     if (!Array.isArray(ids)) throw fail("ID 列表无效");
     const normalized = [...new Set(ids.map(Number).filter(Number.isFinite))];
-    if (!normalized.length) throw fail("ID 列表不能为空");
+    if (!normalized.length && !allowEmpty) throw fail("ID 列表不能为空");
     return normalized;
+  }
+
+  recordToolEvent(event) {
+    if (this.currentTurn) this.currentTurn.toolEvents.push({ ...event, time: new Date().toISOString() });
+    emit("workflow.progress", {
+      phase: this.state.currentPhase,
+      status: "tool_event",
+      tool: event.tool,
+      message: `已观察到 Toonflow 工具事件: ${event.tool}`,
+    });
   }
 
   async fetchFlowData() {
@@ -568,14 +982,23 @@ class ToonflowController {
         const value = match[1].trim();
         if (!value) continue;
         const fingerprint = createHash("sha256").update(`${tag}\0${value}`).digest("hex");
-        if (this.persistedTags.has(fingerprint)) continue;
-        this.persistedTags.add(fingerprint);
+        if (this.persistedTags.has(fingerprint) || this.rejectedTags.has(fingerprint)) continue;
         this.persistQueue = this.persistQueue
           .then(async () => {
             const flow = await this.fetchFlowData();
+            const issue = workspaceValueIssue(tag, value, flow[tag]);
+            if (issue) {
+              this.rejectedTags.add(fingerprint);
+              const rejection = { tag, characters: value.length, previousCharacters: String(flow[tag] ?? "").length, reason: issue };
+              if (this.currentTurn) this.currentTurn.workspaceRejections.push(rejection);
+              emit("workspace.rejected", rejection);
+              return;
+            }
+            this.persistedTags.add(fingerprint);
             flow[tag] = value;
             await this.saveFlowData(flow);
             this.flowData = flow;
+            this.recordToolEvent({ tool: tag, characters: value.length });
             emit("workspace.persisted", { key: tag, characters: value.length });
           })
           .catch((error) => {
@@ -611,6 +1034,8 @@ class ToonflowController {
     clearTimeout(this.turnTimer);
     this.turnTimer = null;
     const messages = [...turn.messageIds].map((id) => this.messages.get(id)).filter(Boolean);
+    this.flowData = await this.fetchFlowData();
+    const afterSnapshot = buildFlowSnapshot(this.flowData);
     const text = stripWorkspaceXml(
       messages
         .flatMap((message) =>
@@ -625,6 +1050,8 @@ class ToonflowController {
       source: turn.source,
       statuses: messages.map((message) => message.status),
       generationFailures: [...turn.generationFailures],
+      toolEvents: [...turn.toolEvents],
+      workspaceRejections: [...turn.workspaceRejections],
       text,
     };
     this.currentTurn = null;
@@ -633,11 +1060,57 @@ class ToonflowController {
       emit("approval.required", { turnId: result.id, reason: "autoApprove 已关闭" });
       return;
     }
-    const decision = classifyTurn(result, this.config, this.repairRounds);
+    const decision = classifyTurn(result, this.config, this.state, turn.beforeSnapshot, afterSnapshot);
     emit("approval.decision", { turnId: result.id, ...decision, prompt: undefined });
-    if (decision.action === "repair") this.repairRounds += 1;
-    if (decision.action === "approve") this.repairRounds = 0;
-    if (["approve", "confirm", "repair"].includes(decision.action)) {
+    this.enterPhase(decision.phase);
+    const activePhase = this.state.currentPhase;
+    const managedActions = ["approve", "confirm", "repair", "retry"];
+    const decisionKey = hashValue(
+      JSON.stringify({ phase: decision.phase, action: decision.action, grade: decision.grade, snapshot: afterSnapshot.digest }),
+    );
+    if (managedActions.includes(decision.action) && this.state.approvedDecisionKeys.includes(decisionKey)) {
+      this.state.lastSnapshot = afterSnapshot;
+      await this.saveState();
+      emit("approval.duplicate_skipped", { turnId: result.id, phase: decision.phase, action: decision.action });
+      emit("approval.required", { turnId: result.id, reason: "同一节点已经审批过；保持静默，等待真实状态变化" });
+      return;
+    }
+    if (decision.action === "repair") {
+      if (decision.resetRepairCycle) this.setRepairRounds(activePhase, 0);
+      this.setRepairRounds(activePhase, phaseCounter(this.state, "repairRoundsByPhase", activePhase, "repairRounds") + 1);
+    }
+    if (decision.action === "approve") this.setRepairRounds(activePhase, 0);
+    if (decision.action === "retry") {
+      if (result.workspaceRejections.length) {
+        this.state.workspaceRecoveryPhase = activePhase;
+        this.state.workspaceRecoveryTags = [...new Set(result.workspaceRejections.map((item) => item.tag))];
+      }
+      if (decision.workspaceRecoveryCompleted) {
+        this.state.workspaceRecoveryPhase = null;
+        this.state.workspaceRecoveryTags = [];
+      }
+      this.setContinuationRetries(
+        activePhase,
+        phaseCounter(this.state, "continuationRetriesByPhase", activePhase, "continuationRetries") + 1,
+      );
+    } else if (decision.action !== "pause") {
+      this.setContinuationRetries(activePhase, 0);
+    }
+    if (managedActions.includes(decision.action)) {
+      this.state.approvedDecisionKeys.push(decisionKey);
+      this.state.approvedDecisionKeys = this.state.approvedDecisionKeys.slice(-100);
+    }
+    if (decision.action === "finish") this.enterPhase("finished");
+    if (decision.action === "generate_prompts") this.enterPhase("stage5.5");
+    this.state.lastSnapshot = afterSnapshot;
+    await this.saveState();
+    emit("workflow.progress", {
+      phase: this.state.currentPhase,
+      status: decision.action,
+      grade: decision.grade,
+      message: decision.reason,
+    });
+    if (managedActions.includes(decision.action)) {
       setTimeout(() => {
         this.send(decision.prompt, `auto:${decision.action}`).catch((error) => emit("controller.error", { message: error.message }));
       }, 100);
@@ -645,6 +1118,21 @@ class ToonflowController {
       emit("approval.required", { turnId: result.id, reason: decision.reason, grade: decision.grade, failures: decision.failures });
     } else if (decision.action === "finish") {
       emit("workflow.finished", { turnId: result.id, reason: decision.reason });
+      await this.close();
+    } else if (decision.action === "generate_prompts") {
+      try {
+        const rows = await this.generateFinalVideoPrompts();
+        this.enterPhase("finished");
+        await this.saveState();
+        emit("workflow.finished", {
+          turnId: result.id,
+          reason: "Seedance 2.0 最终视频提示词已生成",
+          prompts: rows.map((row) => ({ id: row.id, characters: String(row.prompt ?? "").length })),
+        });
+        await this.close();
+      } catch (error) {
+        emit("approval.required", { turnId: result.id, reason: `最终视频提示词生成失败: ${error.message}` });
+      }
     }
   }
 
@@ -654,16 +1142,27 @@ class ToonflowController {
     if (!this.socket?.connected) throw fail("Socket 未连接");
     if (this.currentTurn) throw fail("Toonflow 正在运行；当前轮次完成前禁止发送新指令");
     if (this.generations.size) throw fail("后台生成任务仍在运行；完成前禁止发送新指令");
+    await this.persistQueue;
+    this.flowData = await this.fetchFlowData();
     const turn = {
       id: ++this.turnCounter,
       source,
       messageIds: new Set(),
       generationFailures: [],
+      toolEvents: [],
+      workspaceRejections: [],
+      beforeSnapshot: buildFlowSnapshot(this.flowData),
       startedAt: Date.now(),
     };
     this.currentTurn = turn;
     this.socket.emit("chat", { content: prompt });
     emit("turn.sent", { id: turn.id, source, characters: prompt.length });
+    emit("workflow.progress", {
+      phase: this.state.currentPhase,
+      status: "toonflow_running",
+      turnId: turn.id,
+      message: "Toonflow 执行轨正在运行，Codex 监控轨保持只读监听",
+    });
     this.turnTimer = setTimeout(() => {
       if (this.currentTurn === turn) this.pauseTurn(`轮次超过 ${this.config.turnTimeoutMs}ms 未结束`);
     }, this.config.turnTimeoutMs);
@@ -684,6 +1183,10 @@ class ToonflowController {
   trackGeneration(kind, ids, pollingRoute) {
     const key = `${kind}:${Date.now()}:${ids.join(",")}`;
     const task = this.pollGeneration(kind, ids, pollingRoute)
+      .then((rows) => {
+        this.recordToolEvent({ tool: "generation.complete", kind, ids, results: rows });
+        return rows;
+      })
       .catch((error) => {
         this.recordGenerationFailure(kind, ids, error.message);
         emit("generation.error", { kind, ids, message: error.message });
@@ -727,6 +1230,146 @@ class ToonflowController {
     const failures = terminalRows.filter((row) => /失败|error|failed/i.test(String(row.state)));
     if (failures.length) throw fail(`${kind} 生成失败: ${failures.map((row) => `${row.id}${row.reason ? `(${row.reason})` : ""}`).join(", ")}`);
     emit("generation.complete", { kind, results: terminalRows });
+    return terminalRows;
+  }
+
+  async validateFinalWorkflow(rows) {
+    const flow = await this.fetchFlowData();
+    const issues = [];
+    for (const tag of ["scriptPlan", "storyboardTable"]) {
+      const issue = workspaceValueIssue(tag, flow[tag]);
+      if (issue || String(flow[tag] ?? "").trim().length < WORKSPACE_MIN_CHARACTERS[tag]) {
+        issues.push(issue || `${tag} 内容过短`);
+      }
+    }
+    const storyboard = Array.isArray(flow.storyboard) ? flow.storyboard : [];
+    if (!storyboard.length) issues.push("分镜面板轨道数为 0");
+    const emptyVideoDesc = storyboard.filter((item) => !String(item.videoDesc ?? "").trim());
+    if (emptyVideoDesc.length) issues.push(`${emptyVideoDesc.length} 条分镜缺少 videoDesc`);
+    const imageRequests = storyboard.filter((item) => Number(item.shouldGenerateImage) === 1);
+    if (imageRequests.length) issues.push(`${imageRequests.length} 条分镜仍请求生成分镜图`);
+    if (rows.length !== storyboard.length) issues.push(`最终提示词轨道数 ${rows.length} 与分镜轨道数 ${storyboard.length} 不一致`);
+    const incompletePrompts = rows.filter(
+      (row) =>
+        !String(row?.prompt ?? "").trim() ||
+        /失败|error|failed|生成中|pending/i.test(String(row?.state ?? "")),
+    );
+    if (incompletePrompts.length) issues.push(`${incompletePrompts.length} 条最终提示词为空、失败或仍在生成`);
+    if (issues.length) throw fail(`最终数据验收未通过: ${issues.join("；")}`);
+    this.flowData = flow;
+    this.state.lastSnapshot = buildFlowSnapshot(flow);
+    emit("workflow.acceptance", {
+      scriptPlanCharacters: String(flow.scriptPlan).length,
+      storyboardTableCharacters: String(flow.storyboardTable).length,
+      storyboardTracks: storyboard.length,
+      finalPrompts: rows.length,
+      emptyVideoDesc: 0,
+      imageRequests: 0,
+      incompletePrompts: 0,
+    });
+  }
+
+  async generateFinalVideoPrompts() {
+    const model = String(this.context.videoModel ?? "");
+    if (!/seedance[\s._-]*2(?:[.\s_-]*0)?/i.test(model)) {
+      throw fail(`当前视频模型不是 Seedance 2.0: ${model || "未配置"}`);
+    }
+    const workbench = await this.api.post("/production/workbench/getGenerateData", {
+      projectId: this.context.projectId,
+      scriptId: this.context.scriptId,
+    });
+    const availableTracks = (workbench?.trackList ?? []).filter((track) => Number.isFinite(Number(track.id)));
+    const isReady = (track) =>
+      String(track?.prompt ?? "").trim() && !/失败|error|failed|生成中|pending/i.test(String(track?.state ?? ""));
+    const existing = availableTracks.filter(isReady);
+    const existingById = new Map(
+      existing.map((track) => [Number(track.id), { id: Number(track.id), state: track.state, prompt: track.prompt, existing: true }]),
+    );
+    if (availableTracks.length && existing.length === availableTracks.length) {
+      const rows = availableTracks.map((track) => existingById.get(Number(track.id)));
+      await this.validateFinalWorkflow(rows);
+      emit("final_prompt.skipped", { reason: "all_tracks_already_have_prompts", tracks: rows.map((row) => row.id) });
+      return rows;
+    }
+    const trackData = availableTracks
+      .filter((track) => !isReady(track))
+      .map((track) => {
+        const seen = new Set();
+        const info = (track.medias ?? [])
+          .filter((item) => Number.isFinite(Number(item.id)) && ["storyboard", "assets"].includes(String(item.sources)))
+          .map((item) => ({ id: Number(item.id), sources: String(item.sources) }))
+          .filter((item) => {
+            const key = `${item.sources}:${item.id}`;
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+          });
+        return { trackId: Number(track.id), info };
+      })
+      .filter((track) => track.info.length > 0);
+    if (!trackData.length) throw fail("视频工作台中没有可生成提示词的轨道数据");
+
+    const mode =
+      typeof this.context.videoMode === "string" ? this.context.videoMode : JSON.stringify(this.context.videoMode ?? "");
+    emit("final_prompt.started", { model, tracks: trackData.map((track) => track.trackId), mode });
+    emit("workflow.progress", {
+      phase: "stage5.5",
+      status: "generating_final_prompts",
+      completed: 0,
+      total: trackData.length,
+      message: "正在通过 Toonflow 官方工作台接口生成 Seedance 2.0 最终视频提示词",
+    });
+    await this.api.post("/production/workbench/batchGeneratePrompt", {
+      projectId: this.context.projectId,
+      trackData,
+      mode,
+      model,
+      concurrentCount: this.config.concurrentCount,
+    });
+
+    const trackIds = trackData.map((track) => track.trackId);
+    const completed = new Map();
+    const deadline = Date.now() + Number(this.config.finalPromptTimeoutMs || DEFAULTS.finalPromptTimeoutMs);
+    while (completed.size < trackIds.length) {
+      if (Date.now() >= deadline) {
+        const remaining = trackIds.filter((id) => !completed.has(id));
+        throw fail(`最终视频提示词生成超时，未完成轨道: ${remaining.join(",")}`);
+      }
+      await wait(Number(this.config.finalPromptPollIntervalMs || DEFAULTS.finalPromptPollIntervalMs));
+      const rows =
+        (await this.api.post("/production/workbench/checkVideoPrompt", {
+          projectId: this.context.projectId,
+          scriptId: this.context.scriptId,
+          trackIds,
+        })) ?? [];
+      for (const row of rows) completed.set(Number(row.id), row);
+      emit("final_prompt.progress", { completed: completed.size, total: trackIds.length, remaining: trackIds.filter((id) => !completed.has(id)) });
+      emit("workflow.progress", {
+        phase: "stage5.5",
+        status: "generating_final_prompts",
+        completed: completed.size,
+        total: trackIds.length,
+        message: `Seedance 2.0 最终视频提示词进度 ${completed.size}/${trackIds.length}`,
+      });
+    }
+
+    const generatedRows = trackIds.map((id) => completed.get(id));
+    const failures = generatedRows.filter(
+      (row) => row?.state === "生成失败" || !String(row?.prompt ?? "").trim() || /生成中|pending/i.test(String(row?.state ?? "")),
+    );
+    if (failures.length) {
+      throw fail(
+        `最终视频提示词生成失败: ${failures.map((row) => `${row?.id ?? "未知轨道"}${row?.reason ? `(${row.reason})` : ""}`).join(", ")}`,
+      );
+    }
+    const generatedById = new Map(generatedRows.map((row) => [Number(row.id), row]));
+    const rows = availableTracks.map((track) => generatedById.get(Number(track.id)) ?? existingById.get(Number(track.id)));
+    await this.validateFinalWorkflow(rows);
+    emit("final_prompt.complete", {
+      model,
+      prompts: rows.map((row) => ({ id: row.id, characters: String(row.prompt).length })),
+    });
+    return rows;
   }
 
   status() {
@@ -735,7 +1378,9 @@ class ToonflowController {
       activeTurn: this.currentTurn?.id ?? null,
       activeMessages: this.currentTurn ? [...this.currentTurn.messageIds] : [],
       generations: [...this.generations.keys()],
-      repairRounds: this.repairRounds,
+      phase: this.state.currentPhase,
+      repairRounds: this.state.repairRounds,
+      continuationRetries: this.state.continuationRetries,
       autoApprove: Boolean(this.config.autoApprove),
     });
   }
@@ -748,6 +1393,8 @@ class ToonflowController {
       storyboardTableCharacters: String(flow.storyboardTable ?? "").length,
       assets: flow.assets?.length ?? 0,
       storyboard: flow.storyboard?.length ?? 0,
+      storyboardPrompts: (flow.storyboard ?? []).filter((item) => String(item.prompt ?? "").trim()).length,
+      storyboardImagesRequested: (flow.storyboard ?? []).filter((item) => Number(item.shouldGenerateImage) === 1).length,
     });
   }
 
@@ -799,11 +1446,101 @@ class ToonflowController {
     this.closed = true;
     clearTimeout(this.quietTimer);
     clearTimeout(this.turnTimer);
+    this.state.pid = null;
+    await this.saveState().catch((error) => emit("state.warning", { message: `状态文件保存失败: ${error.message}` }));
     this.socket?.disconnect();
     this.rl?.close();
     emit("controller.closed");
     process.exitCode = 0;
   }
+}
+
+let activeController = null;
+
+function runSelfTests() {
+  const checks = [];
+  const check = (name, condition) => {
+    if (!condition) throw fail(`自检失败: ${name}`);
+    checks.push(name);
+  };
+
+  const continuedRepair = gradeDecision(
+    "C",
+    { ...DEFAULTS, maxRepairRounds: 2 },
+    2,
+    "评分：C。问题清单：台词时长不足。建议方案：延长镜头。",
+  );
+  check("C/D 达到本地轮数后重置并继续", continuedRepair?.action === "repair" && continuedRepair.resetRepairCycle === true);
+
+  const stable = buildFlowSnapshot({ scriptPlan: "计".repeat(300), storyboardTable: "镜".repeat(300), assets: [], storyboard: [] });
+  const changed = buildFlowSnapshot({ scriptPlan: "计".repeat(300), storyboardTable: "新".repeat(300), assets: [], storyboard: [] });
+  const reviewDecision = classifyTurn(
+    {
+      statuses: ["complete"],
+      generationFailures: [],
+      workspaceRejections: [],
+      toolEvents: [{ tool: "storyboardTable" }],
+      text: "评分：B。此前错误均已修复，失败项为零。",
+    },
+    DEFAULTS,
+    { currentPhase: "stage4", repairRounds: 1, repairRoundsByPhase: { stage4: 1 } },
+    stable,
+    changed,
+  );
+  check("审核正文中的错误/失败不触发系统误停", reviewDecision?.action === "approve");
+
+  const isolatedState = { currentPhase: "stage1", repairRounds: 2, repairRoundsByPhase: { stage1: 2 } };
+  check("阶段修复轮数隔离", phaseCounter(isolatedState, "repairRoundsByPhase", "stage4", "repairRounds") === 0);
+
+  const retryDecision = classifyTurn(
+    {
+      statuses: ["complete"],
+      generationFailures: [],
+      workspaceRejections: [],
+      toolEvents: [],
+      text: "现在进入阶段5，让我立即派发执行层。",
+    },
+    { ...DEFAULTS, maxNoEvidenceRetries: 1 },
+    { currentPhase: "stage5", continuationRetries: 0, continuationRetriesByPhase: { stage5: 0 } },
+    stable,
+    stable,
+  );
+  check("承诺性回复无证据时自动续催", retryDecision?.action === "retry");
+
+  const retryExhausted = classifyTurn(
+    {
+      statuses: ["complete"],
+      generationFailures: [],
+      workspaceRejections: [],
+      toolEvents: [],
+      text: "现在进入阶段5，让我立即派发执行层。",
+    },
+    { ...DEFAULTS, maxNoEvidenceRetries: 1 },
+    { currentPhase: "stage5", continuationRetries: 1, continuationRetriesByPhase: { stage5: 1 } },
+    stable,
+    stable,
+  );
+  check("自动续催有界", retryExhausted?.action === "pause");
+
+  const recoveryDecision = classifyTurn(
+    {
+      statuses: ["complete"],
+      generationFailures: [],
+      workspaceRejections: [],
+      toolEvents: [{ tool: "scriptPlan" }],
+      text: "完整导演计划已恢复。",
+    },
+    DEFAULTS,
+    { currentPhase: "stage4", workspaceRecoveryPhase: "stage4", workspaceRecoveryTags: ["scriptPlan"] },
+    stable,
+    { ...stable, scriptPlanHash: hashValue("恢复后的完整计划") },
+  );
+  check("关键字段恢复后返回原阶段", recoveryDecision?.action === "retry" && recoveryDecision.phase === "stage4");
+
+  check("拒绝 scriptPlan 占位覆盖", Boolean(workspaceValueIssue("scriptPlan", "...", "完整计划".repeat(300))));
+  check("接受完整 scriptPlan", !workspaceValueIssue("scriptPlan", "完整计划".repeat(300), "原计划".repeat(300)));
+
+  emit("self_test.complete", { passed: checks.length, checks });
 }
 
 async function main() {
@@ -812,7 +1549,12 @@ async function main() {
     printHelp();
     return;
   }
+  if (args.selfTest) {
+    runSelfTests();
+    return;
+  }
   const config = await loadConfig(args);
+  await ensureBackend(config);
   const api = new ToonflowApi(config.baseUrl);
   await api.authenticate();
   if (args.list) {
@@ -821,7 +1563,21 @@ async function main() {
   }
   const context = await resolveContext(api, config);
   const controller = new ToonflowController(api, context, config);
+  activeController = controller;
   await controller.initialize();
+  if (args.finalPrompts) {
+    controller.enterPhase("stage5.5");
+    await controller.saveState();
+    const rows = await controller.generateFinalVideoPrompts();
+    controller.enterPhase("finished");
+    await controller.saveState();
+    emit("workflow.finished", {
+      reason: "Seedance 2.0 最终视频提示词已生成",
+      prompts: rows.map((row) => ({ id: row.id, characters: String(row.prompt ?? "").length, existing: Boolean(row.existing) })),
+    });
+    await controller.close();
+    return;
+  }
   if (args.probe) {
     controller.flowSummary();
     await controller.close();
@@ -833,7 +1589,10 @@ async function main() {
   if (config.autoStart) await controller.send(config.startPrompt, "auto:start");
 }
 
-main().catch((error) => {
+main().catch(async (error) => {
   emit("fatal", { message: error.message, cause: error.cause?.message });
+  await activeController?.close().catch((closeError) => {
+    emit("controller.close_warning", { message: closeError.message });
+  });
   process.exitCode = 1;
 });

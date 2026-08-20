@@ -3,8 +3,13 @@
   "projectName": "我拿三十年寿命换了个“升级咯”",
   "scriptIndex": 0,
   "autoStart": false,
+  "ensureBackend": true,
+  "backendStartupTimeoutMs": 30000,
   "autoApprove": true,
-  "autoApproveUnscored": true,
+  "stateFile": "user/tools/controller-state.json",
+  "generateFinalVideoPrompts": true,
+  "finalPromptTimeoutMs": 1800000,
+  "finalPromptPollIntervalMs": 5000,
   "startPrompt": "从导演规划开始，严格按 Toonflow 自身的制作流程推进；每个需要用户确认的节点完成后等待审批。",
   "quietPeriodMs": 4000,
   "pollIntervalMs": 5000,
@@ -12,6 +17,8 @@
   "turnTimeoutMs": 1800000,
   "concurrentCount": 5,
   "maxRepairRounds": 2,
+  "maxNoEvidenceRetries": 1,
+  "initialRepairRounds": 0,
   "think": false,
   "thinkLevel": 0
 }
