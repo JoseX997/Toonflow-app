@@ -24,10 +24,13 @@ const DEFAULTS = {
   ensureBackend: true,
   backendStartupTimeoutMs: 30 * 1000,
   stateFile: "user/tools/controller-state.json",
+  autoAdvanceEpisodes: true,
   generateFinalVideoPrompts: false,
   finalPromptTimeoutMs: 30 * 60 * 1000,
   finalPromptPollIntervalMs: 5000,
   startPrompt: "从导演规划开始，严格按 Toonflow 自身的制作流程推进；每个需要用户确认的节点完成后等待审批。",
+  nextEpisodeStartPrompt:
+    "从导演规划开始，严格按 Toonflow 自身的完整制作流程推进当前新分集；每个需要用户确认的节点完成后等待审批，直到视频工作台全部轨道生成 Seedance 2.0 最终视频提示词。",
   approvalPrompt: "审核通过，继续 Toonflow 原生流程的下一阶段。",
   confirmPrompt: "确认。若当前节点要求选择生成范围，选择 Toonflow 当前清单中的全部项目；其余情况按 Toonflow 当前默认路线继续下一阶段。",
   repairPrompt:
@@ -326,6 +329,43 @@ async function resolveContext(api, config) {
   return context;
 }
 
+function contextFromProjectScript(project, script) {
+  return {
+    projectId: Number(project.id),
+    projectName: itemName(project),
+    scriptId: Number(script.id),
+    scriptName: itemName(script),
+    videoModel: project.videoModel,
+    videoMode: project.mode,
+  };
+}
+
+function nextScriptInOrder(scripts, currentScriptId) {
+  const index = scripts.findIndex((script) => Number(script.id) === Number(currentScriptId));
+  if (index < 0) throw fail(`当前分集 ID ${currentScriptId} 已不在项目分集列表中`);
+  return scripts[index + 1] ?? null;
+}
+
+async function resolveNextContext(api, currentContext) {
+  const projects = (await api.post("/project/getProject", {})) ?? [];
+  const project = pickByIdOrName(projects, currentContext.projectId, null, "项目");
+  const scripts = (await api.post("/script/getScrptApi", { projectId: Number(project.id) })) ?? [];
+  const script = nextScriptInOrder(scripts, currentContext.scriptId);
+  if (!script) return null;
+  return contextFromProjectScript(project, script);
+}
+
+function stateFileForEpisode(config, context, isInitialEpisode) {
+  const configured = String(config.stateFile || DEFAULTS.stateFile);
+  if (configured.includes("{scriptId}") || configured.includes("{projectId}")) {
+    return configured.replaceAll("{projectId}", String(context.projectId)).replaceAll("{scriptId}", String(context.scriptId));
+  }
+  if (isInitialEpisode) return configured;
+  const extension = path.extname(configured);
+  const stem = extension ? configured.slice(0, -extension.length) : configured;
+  return `${stem}.script-${context.scriptId}${extension}`;
+}
+
 function appendValue(current, incoming) {
   if (incoming === undefined) return current;
   if (typeof current === "string" && typeof incoming === "string") return current + incoming;
@@ -609,7 +649,7 @@ function processIsRunning(pid) {
 }
 
 class ToonflowController {
-  constructor(api, context, config) {
+  constructor(api, context, config, onEpisodeFinished = null) {
     this.api = api;
     this.context = context;
     this.config = config;
@@ -644,6 +684,7 @@ class ToonflowController {
     };
     this.closed = false;
     this.rl = null;
+    this.onEpisodeFinished = onEpisodeFinished;
   }
 
   async initialize() {
@@ -1119,6 +1160,7 @@ class ToonflowController {
     } else if (decision.action === "finish") {
       emit("workflow.finished", { turnId: result.id, reason: decision.reason });
       await this.close();
+      await this.advanceAfterEpisode();
     } else if (decision.action === "generate_prompts") {
       try {
         const rows = await this.generateFinalVideoPrompts();
@@ -1130,6 +1172,7 @@ class ToonflowController {
           prompts: rows.map((row) => ({ id: row.id, characters: String(row.prompt ?? "").length })),
         });
         await this.close();
+        await this.advanceAfterEpisode();
       } catch (error) {
         emit("approval.required", { turnId: result.id, reason: `最终视频提示词生成失败: ${error.message}` });
       }
@@ -1450,8 +1493,22 @@ class ToonflowController {
     await this.saveState().catch((error) => emit("state.warning", { message: `状态文件保存失败: ${error.message}` }));
     this.socket?.disconnect();
     this.rl?.close();
-    emit("controller.closed");
+    emit("controller.closed", { projectId: this.context.projectId, scriptId: this.context.scriptId });
     process.exitCode = 0;
+  }
+
+  async advanceAfterEpisode() {
+    if (!this.onEpisodeFinished) return;
+    try {
+      await this.onEpisodeFinished(this.context);
+    } catch (error) {
+      emit("series.error", {
+        projectId: this.context.projectId,
+        scriptId: this.context.scriptId,
+        message: error.message,
+      });
+      process.exitCode = 1;
+    }
   }
 }
 
@@ -1539,6 +1596,24 @@ function runSelfTests() {
 
   check("拒绝 scriptPlan 占位覆盖", Boolean(workspaceValueIssue("scriptPlan", "...", "完整计划".repeat(300))));
   check("接受完整 scriptPlan", !workspaceValueIssue("scriptPlan", "完整计划".repeat(300), "原计划".repeat(300)));
+  check(
+    "按项目分集顺序选择下一集",
+    Number(nextScriptInOrder([{ id: 3 }, { id: 8 }, { id: 13 }], 8)?.id) === 13,
+  );
+  check("最后一集没有下一集", nextScriptInOrder([{ id: 3 }, { id: 8 }], 8) === null);
+  check(
+    "后续分集状态文件隔离",
+    stateFileForEpisode({ stateFile: "user/tools/controller-state.json" }, { projectId: 1, scriptId: 8 }, false) ===
+      "user/tools/controller-state.script-8.json",
+  );
+  check(
+    "状态文件模板绑定准确分集",
+    stateFileForEpisode(
+      { stateFile: "user/tools/controller-state.{projectId}.{scriptId}.json" },
+      { projectId: 5, scriptId: 8 },
+      false,
+    ) === "user/tools/controller-state.5.8.json",
+  );
 
   emit("self_test.complete", { passed: checks.length, checks });
 }
@@ -1562,10 +1637,10 @@ async function main() {
     return;
   }
   const context = await resolveContext(api, config);
-  const controller = new ToonflowController(api, context, config);
-  activeController = controller;
-  await controller.initialize();
   if (args.finalPrompts) {
+    const controller = new ToonflowController(api, context, config);
+    activeController = controller;
+    await controller.initialize();
     controller.enterPhase("stage5.5");
     await controller.saveState();
     const rows = await controller.generateFinalVideoPrompts();
@@ -1579,14 +1654,65 @@ async function main() {
     return;
   }
   if (args.probe) {
+    const controller = new ToonflowController(api, context, config);
+    activeController = controller;
+    await controller.initialize();
     controller.flowSummary();
     await controller.close();
     return;
   }
-  process.on("SIGINT", () => controller.close());
-  process.on("SIGTERM", () => controller.close());
-  controller.startConsole();
-  if (config.autoStart) await controller.send(config.startPrompt, "auto:start");
+  const runEpisode = async (episodeContext, isInitialEpisode) => {
+    const episodeConfig = {
+      ...config,
+      stateFile: stateFileForEpisode(config, episodeContext, isInitialEpisode),
+    };
+    const controller = new ToonflowController(api, episodeContext, episodeConfig, async (completedContext) => {
+      if (!config.autoAdvanceEpisodes) {
+        emit("series.finished", {
+          projectId: completedContext.projectId,
+          scriptId: completedContext.scriptId,
+          reason: "autoAdvanceEpisodes_disabled",
+        });
+        return;
+      }
+      const nextContext = await resolveNextContext(api, completedContext);
+      if (!nextContext) {
+        emit("series.finished", {
+          projectId: completedContext.projectId,
+          scriptId: completedContext.scriptId,
+          reason: "no_next_episode",
+        });
+        return;
+      }
+      emit("episode.advancing", {
+        fromScriptId: completedContext.scriptId,
+        toScriptId: nextContext.scriptId,
+        toScriptName: nextContext.scriptName,
+      });
+      await runEpisode(nextContext, false);
+    });
+    activeController = controller;
+    await controller.initialize();
+    if (controller.state.currentPhase === "finished") {
+      emit("episode.already_finished", {
+        projectId: episodeContext.projectId,
+        scriptId: episodeContext.scriptId,
+        stateFile: controller.statePath,
+      });
+      await controller.close();
+      await controller.advanceAfterEpisode();
+      return;
+    }
+    controller.startConsole();
+    if (episodeConfig.autoStart) {
+      const prompt = isInitialEpisode ? episodeConfig.startPrompt : episodeConfig.nextEpisodeStartPrompt;
+      await controller.send(prompt, isInitialEpisode ? "auto:start" : "auto:next_episode");
+    }
+  };
+
+  process.on("SIGINT", () => activeController?.close());
+  process.on("SIGTERM", () => activeController?.close());
+  await runEpisode(context, true);
 }
 
 main().catch(async (error) => {

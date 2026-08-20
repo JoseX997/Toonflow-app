@@ -18,11 +18,17 @@
 - `scriptPlan` 或 `storyboardTable` 若被 `...`、空对象或异常短文本覆盖，控制器会拒绝写入并要求执行层恢复完整字段；
 - 将阶段、修复轮次和已审批节点持久化到 `user/tools/controller-state.json`，重启后继续使用；
 - 当阶段5全部分镜均为“不出图”且 `generateFinalVideoPrompts=true` 时，调用 Toonflow 官方视频工作台接口生成 Seedance 2.0 最终视频提示词，然后结束流程，不生成分镜图或视频；
+- 当前集完成后重新读取项目分集列表，按 Toonflow 返回的分集顺序绑定下一集准确的 `scriptId` 并从导演规划继续；只有没有下一集时才退出；
+- 每个后续分集使用独立状态文件，避免修复轮数、审批指纹和完成状态跨集复用；
 - 以 `workflow.progress` JSON Lines 事件持续输出监控进度，供 Codex 显示和追踪。
 
 `initialRepairRounds` 只在首次创建状态文件时作为初始值；之后以持久化状态为准。
 
 `maxRepairRounds` 是单个阶段的本地计数周期，不是 C/D 审核的终止上限；达到该数值且原生修复建议仍明确时会清零并继续。`maxNoEvidenceRetries` 控制承诺性空回复的自动续催次数，默认仅续催 1 次，避免无限发送。
+
+默认配置 `"autoAdvanceEpisodes": true`。当前集完整验收后，控制器会重新调用 Toonflow 分集列表接口定位下一集；有下一集时自动开始该集，没有下一集时输出 `series.finished` 并退出。若只想运行当前一集，可设为 `false`。
+
+首集使用 `stateFile` 原路径，自动切换后的分集会在文件名中追加 `.script-<scriptId>`。也可显式使用模板，例如 `user/tools/controller-state.{projectId}.{scriptId}.json`。这样重启时会跳过已完成集，并从尚未完成的下一集继续。
 
 ## 凭据
 
@@ -71,7 +77,7 @@ node .\user\tools\toonflow-controller.mjs --config .\user\tools\config.example.j
 node .\user\tools\toonflow-controller.mjs --config .\user\tools\config.example.json --final-prompts
 ```
 
-该命令会自动检查/启动后端，读取现有分镜轨道、视频描述和关联资产，通过官方 `batchGeneratePrompt` 接口生成提示词并轮询到终态。它不会向 Toonflow 对话框发送新任务，也不会调用图片或视频生成接口。所有轨道已经存在非空提示词时会直接跳过，避免重复生成。
+该命令会自动检查/启动后端，读取现有分镜轨道、视频描述和关联资产，通过官方 `batchGeneratePrompt` 接口生成提示词并轮询到终态。它不会向 Toonflow 对话框发送新任务，也不会调用图片或视频生成接口。所有轨道已经存在非空提示词时会直接跳过，避免重复生成。`--final-prompts` 是当前集专项命令，不触发自动切集；完整自动切集由常规控制器流程执行。
 
 控制器内置纯逻辑自检，不连接后端、不发送项目内容：
 
