@@ -476,11 +476,39 @@ function analyzeSevereIssues(text) {
   const section = problemListSection(text);
   const severityPattern = /(?:\*{0,2})严重程度(?:\*{0,2})\s*[:：]\s*(?:\*{0,2})严重(?:\*{0,2})(?=$|[\s，,；;。])/g;
   const matches = [...section.matchAll(severityPattern)];
-  const issues = matches.map((match, index) => {
+  const labeledIssues = matches.map((match, index) => {
     const following = section.slice(match.index + match[0].length, matches[index + 1]?.index ?? section.length);
     const advice = /(?:\*{0,2})建议方案(?:\*{0,2})\s*[:：]\s*(?!无(?:\s|$)|未提供|缺失)(\S[\s\S]*)/i.exec(following);
     return { hasAdvice: Boolean(advice), adviceCharacters: advice ? advice[1].trim().length : 0 };
   });
+  const tableIssues = [];
+  const lines = section.split(/\r?\n/);
+  for (let index = 0; index < lines.length; index += 1) {
+    if (!lines[index].includes("|")) continue;
+    const headers = lines[index]
+      .split("|")
+      .slice(1, -1)
+      .map((cell) => cell.replace(/[*_`]/g, "").trim());
+    const severityIndex = headers.findIndex((cell) => cell === "严重程度");
+    const adviceIndex = headers.findIndex((cell) => /建议方案/.test(cell));
+    if (severityIndex < 0) continue;
+    for (let rowIndex = index + 1; rowIndex < lines.length && lines[rowIndex].includes("|"); rowIndex += 1) {
+      const cells = lines[rowIndex]
+        .split("|")
+        .slice(1, -1)
+        .map((cell) => cell.replace(/[*_`]/g, "").trim());
+      if (cells.every((cell) => /^:?-{3,}:?$/.test(cell))) continue;
+      const severity = String(cells[severityIndex] ?? "").replace(/[🔴🟠🟡⚪]/gu, "").trim();
+      if (severity !== "严重") continue;
+      const advice = String(cells[adviceIndex] ?? "").trim();
+      tableIssues.push({
+        hasAdvice: adviceIndex >= 0 && Boolean(advice) && !/^(?:无|未提供|缺失|[-—]+)$/.test(advice),
+        adviceCharacters: advice.length,
+      });
+    }
+    break;
+  }
+  const issues = [...labeledIssues, ...tableIssues];
   return {
     count: issues.length,
     missingAdvice: issues.filter((issue) => !issue.hasAdvice).length,
@@ -1696,6 +1724,24 @@ function runSelfTests() {
     "评分：A\n问题清单：\n1. 因果断裂\n严重程度：严重\n审核结论：暂不通过",
   );
   check("严重项缺少对应建议方案时暂停", missingSevereAdvice?.action === "pause");
+
+  const severeTableReport = [
+    "评分：A",
+    "## 问题清单",
+    "| # | 严重程度 | 审核项 | 问题 | 建议方案 |",
+    "|---|---|---|---|---|",
+    "| 1 | 🔴 严重 | 连续性 | 人物状态断裂 | 按前场状态修复动作衔接 |",
+  ].join("\n");
+  const severeTableA = gradeDecision("A", DEFAULTS, 0, severeTableReport);
+  check("表格问题清单中的严重项阻止 A 级通过", severeTableA?.action === "repair" && severeTableA.severeIssues === 1);
+
+  const severeTableMissingAdvice = gradeDecision(
+    "A",
+    DEFAULTS,
+    0,
+    severeTableReport.replace("按前场状态修复动作衔接", "无"),
+  );
+  check("表格严重项缺少建议方案时暂停", severeTableMissingAdvice?.action === "pause");
 
   emit("self_test.complete", { passed: checks.length, checks });
 }
